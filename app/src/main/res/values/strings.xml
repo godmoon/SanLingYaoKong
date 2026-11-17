@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OpenRemo</string>
+    <string name="tab_remote">遥控</string>
+    <string name="tab_devices">设备</string>
+    <string name="tab_settings">设置</string>
+    <string name="status_disconnected">未连接</string>
+    <string name="status_connecting">连接中…</string>
+    <string name="status_authenticating">登录中…</string>
+    <string name="status_ready">已连接</string>
+    <string name="status_reconnecting">正在重连…</string>
+    <string name="status_error">连接异常</string>
+    <string name="room_temp">室内</string>
+    <string name="power">电源</string>
+    <string name="mode">模式</string>
+    <string name="temperature">温度</string>
+    <string name="fan_speed">风速</string>
+    <string name="vane">上下风向</string>
+    <string name="extras">附加功能</string>
+</resources>
