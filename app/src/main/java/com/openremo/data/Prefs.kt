@@ -36,6 +36,32 @@ class Prefs(context: Context) {
         get() = sp.getBoolean(KEY_AUTO_CONNECT, true)
         set(value) = sp.edit().putBoolean(KEY_AUTO_CONNECT, value).apply()
 
+    // ---------------------------------------------------------------- 多设备记录
+
+    var records: List<RemoteRecord>
+        get() = RemoteRecord.decode(sp.getString(KEY_RECORDS, ""))
+        set(value) = sp.edit().putString(KEY_RECORDS, RemoteRecord.encode(value)).apply()
+
+    var selectedAddress: String
+        get() = sp.getString(KEY_SELECTED, "") ?: ""
+        set(value) = sp.edit().putString(KEY_SELECTED, value).apply()
+
+    /** 把旧版本的单设备配置迁移成一条记录。 */
+    fun migrateLegacyIfNeeded() {
+        if (records.isNotEmpty()) return
+        val address = deviceAddress
+        if (address.isBlank()) return
+        val record = RemoteRecord(
+            address = address,
+            alias = "",
+            deviceName = deviceName,
+            guest = guestMode,
+            password = password,
+        )
+        records = listOf(record)
+        selectedAddress = address
+    }
+
     private companion object {
         const val KEY_ADDRESS = "device_address"
         const val KEY_NAME = "device_name"
@@ -44,5 +70,7 @@ class Prefs(context: Context) {
         const val KEY_POLL = "poll_seconds"
         const val KEY_RECONNECT = "auto_reconnect"
         const val KEY_AUTO_CONNECT = "auto_connect"
+        const val KEY_RECORDS = "records"
+        const val KEY_SELECTED = "selected_address"
     }
 }

@@ -13,6 +13,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.google.android.material.snackbar.Snackbar
 import com.openremo.R
+import com.openremo.data.AppState
 import com.openremo.data.RemoRepository
 import com.openremo.databinding.ActivityMainBinding
 import com.openremo.ui.view.RemoteFragment
@@ -23,15 +24,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
 
     private val permissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
-            val granted = result.values.all { it }
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            val granted = hasBlePermissions()
             if (granted) {
-                Snackbar.make(binding.root, "权限已授予，可以扫描设备了", Snackbar.LENGTH_SHORT).show()
-                if (RemoRepository.uiState.value.savedDevice.deviceAddress.isNotBlank() &&
-                    !RemoRepository.uiState.value.connected
-                ) {
-                    RemoRepository.connectSaved()
-                }
+                Snackbar.make(binding.root, "权限已授予", Snackbar.LENGTH_SHORT).show()
+                // 信号任务会自动开始，并在启动时选出信号最好的遥控器
             } else {
                 Snackbar.make(binding.root, "没有蓝牙权限无法扫描和连接设备", Snackbar.LENGTH_LONG).show()
             }
@@ -49,19 +46,8 @@ class MainActivity : AppCompatActivity() {
                 .commitNow()
         }
 
-        binding.bottomNav.setOnItemSelectedListener { item ->
-            when (item.itemId) {
-                R.id.nav_remote -> show(RemoteFragment(), TAG_REMOTE)
-                R.id.nav_devices -> show(DevicesFragment(), TAG_DEVICES)
-                R.id.nav_settings -> show(SettingsFragment(), TAG_SETTINGS)
-                else -> return@setOnItemSelectedListener false
-            }
-            true
-        }
-        // 首次创建时显示遥控页；重建时交给 FragmentManager 恢复原页面
-        if (savedInstanceState == null) {
-            binding.bottomNav.selectedItemId = R.id.nav_remote
-        }
+        // 首次启动先请求权限，否则无法扫描信号、也无法自动选中最好的遥控器
+        if (!hasBlePermissions()) ensureBlePermissions()
 
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -72,22 +58,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun show(fragment: Fragment, tag: String) {
-        val manager = supportFragmentManager
-        val transaction = manager.beginTransaction()
-        val existing = manager.findFragmentByTag(tag)
-        manager.fragments.forEach { transaction.hide(it) }
-        if (existing != null) {
-            transaction.show(existing)
-        } else {
-            transaction.add(R.id.fragment_container, fragment, tag)
-        }
-        // 用 commitNow 保证连续切换时 hide/show 不会排队交错
-        transaction.commitNow()
+    override fun onStart() {
+        // 先标记前台再分发 Fragment 生命周期，轮询任务据此判断是否需要工作
+        AppState.foreground = true
+        super.onStart()
+    }
+
+    override fun onStop() {
+        AppState.foreground = false
+        super.onStop()
     }
 
     private fun currentFragment(): Fragment? =
-        supportFragmentManager.fragments.firstOrNull { !it.isHidden }
+        supportFragmentManager.findFragmentById(R.id.fragment_container)
 
     fun hasBlePermissions(): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -104,16 +87,32 @@ class MainActivity : AppCompatActivity() {
             (currentFragment() as? PermissionsAware)?.onPermissionsResult()
             return
         }
-        val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
-        } else {
-            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
-        }
+        val permissions = buildList {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                add(Manifest.permission.BLUETOOTH_SCAN)
+                add(Manifest.permission.BLUETOOTH_CONNECT)
+            } else {
+                add(Manifest.permission.ACCESS_FINE_LOCATION)
+                add(Manifest.permission.ACCESS_COARSE_LOCATION)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }.toTypedArray()
         permissionLauncher.launch(permissions)
     }
 
-    fun openRemote() {
-        binding.bottomNav.selectedItemId = R.id.nav_remote
+    /** 单页模式保留此方法，兼容旧调用方。 */
+    fun openRemote() = Unit
+
+    private var notificationAsked = false
+
+    fun ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (has(Manifest.permission.POST_NOTIFICATIONS)) return
+        if (notificationAsked) return
+        notificationAsked = true
+        permissionLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
     }
 
     interface PermissionsAware {
@@ -122,7 +121,5 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val TAG_REMOTE = "remote"
-        const val TAG_DEVICES = "devices"
-        const val TAG_SETTINGS = "settings"
     }
 }

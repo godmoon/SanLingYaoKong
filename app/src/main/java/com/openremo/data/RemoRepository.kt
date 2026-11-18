@@ -1,6 +1,7 @@
 package com.openremo.data
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import com.openremo.ble.RemoBleClient
 import com.openremo.protocol.AcState
@@ -15,6 +16,8 @@ import com.openremo.protocol.MoveEye
 import com.openremo.protocol.ScannedDevice
 import com.openremo.protocol.Vane
 import com.openremo.protocol.Vent
+import com.openremo.timer.TimerScheduler
+import com.openremo.timer.TimerService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -26,6 +29,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -57,13 +61,25 @@ object RemoRepository {
         val lastUpdate: Long = 0,
         /** 登录时读到的机型能力表；known=false 时按全量控件显示 */
         val capabilities: DeviceCapabilities = DeviceCapabilities(),
+        /** 已保存的全部遥控器 */
+        val records: List<RemoteRecord> = emptyList(),
+        /** 当前选中的遥控器地址 */
+        val selectedAddress: String = "",
+        /** 最近一次失败是否因为密码/登录信息错误 */
+        val passwordError: Boolean = false,
+        /** 顶部卡片的显示顺序（按每轮扫描后的信号从强到弱），避免信号刷新时频繁重排 */
+        val displayOrder: List<String> = emptyList(),
     ) {
         val connected: Boolean get() = phase == Phase.READY
+
+        val selectedRecord: RemoteRecord?
+            get() = records.firstOrNull { it.address == selectedAddress }
     }
 
     private lateinit var prefs: Prefs
     private lateinit var ble: RemoBleClient
     private lateinit var engine: ProtocolEngine
+    private lateinit var appContext: Context
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val commandMutex = Mutex()
@@ -90,18 +106,28 @@ object RemoRepository {
     @Volatile
     private var userStopped = true
 
+    /** 用户是否手动切换过遥控器，手动选择后不再自动改选中项 */
+    @Volatile
+    private var userSelected = false
+
+    /** 本次进程是否已经做过启动时的 1 秒信号检测 */
+    @Volatile
+    private var initialSelectionDone = false
+
     private var initialized = false
 
     fun init(context: Context) {
         if (initialized) return
         initialized = true
-        prefs = Prefs(context.applicationContext)
-        ble = RemoBleClient(context.applicationContext)
+        appContext = context.applicationContext
+        prefs = Prefs(appContext)
+        ble = RemoBleClient(appContext)
         engine = ProtocolEngine(ble) { tag, message -> log(tag, message) }
 
         ble.listener = object : RemoBleClient.Listener {
             override fun onBleReady() {
                 readyDeferred?.complete(Unit)
+                ble.readRssi()
             }
 
             override fun onBleDisconnected(reason: String) {
@@ -117,31 +143,73 @@ object RemoRepository {
             override fun onBleLog(tag: String, message: String) {
                 log(tag, message)
             }
+
+            override fun onBleRssi(rssi: Int) {
+                scope.launch { updateSelectedRssi(rssi) }
+            }
         }
         ble.scanListener = { device ->
+            // 窗口标记在回调线程上取一次，避免协程排队后标记已复位
+            val buffering = trackingScan
             scope.launch {
                 _uiState.update { state ->
-                    val existing = state.scanDevices.filterNot { it.address == device.address }
-                    state.copy(scanDevices = (existing + device).sortedByDescending { it.rssi })
+                    // 已经添加过的遥控器不再出现在扫描列表里，但信号值仍会刷新
+                    if (state.records.any { it.address == device.address }) {
+                        state
+                    } else {
+                        val existing = state.scanDevices.filterNot { it.address == device.address }
+                        state.copy(scanDevices = (existing + device).sortedByDescending { it.rssi })
+                    }
+                }
+                if (buffering) {
+                    // 信号扫描窗口内先攒着，等这一轮扫完再一次性刷新，避免数值每包都跳
+                    scanSeen.add(device.address)
+                    pendingRssi[device.address] = device.rssi
+                } else {
+                    // 用户手动扫描（添加遥控器）时直接刷新，列表需要实时反馈
+                    updateRecordRssi(device.address, device.rssi)
                 }
             }
         }
 
+        prefs.migrateLegacyIfNeeded()
+        val records = prefs.records
+        val selected = prefs.selectedAddress
+            .takeIf { address -> records.any { it.address == address } }
+            ?: records.maxByOrNull { it.rssi }?.address
+            ?: ""
+        if (selected.isNotBlank()) prefs.selectedAddress = selected
+        val selectedRecord = records.firstOrNull { it.address == selected }
+        val legacySaved = ConnectionInfo(selectedRecord?.title ?: "", selected)
+
         _uiState.update {
             it.copy(
-                savedDevice = ConnectionInfo(prefs.deviceName, prefs.deviceAddress),
-                device = ConnectionInfo(prefs.deviceName, prefs.deviceAddress),
+                savedDevice = legacySaved,
+                device = ConnectionInfo(selectedRecord?.deviceName ?: "", selected),
                 pollSeconds = prefs.pollSeconds,
                 autoReconnect = prefs.autoReconnect,
-                guestMode = prefs.guestMode,
-                password = prefs.password,
+                guestMode = selectedRecord?.guest ?: prefs.guestMode,
+                password = selectedRecord?.password ?: prefs.password,
                 autoConnect = prefs.autoConnect,
+                records = records,
+                selectedAddress = selected,
+                displayOrder = records.sortedByDescending { it.signal }.map { it.address },
             )
         }
+    }
 
-        if (prefs.autoConnect && prefs.deviceAddress.isNotBlank() && ble.hasPermissions()) {
-            connectSaved()
+    /** 手动切换遥控器（用户点击卡片），会阻止启动时的“自动选中信号最好”覆盖用户选择。 */
+    fun selectRecord(address: String) {
+        userSelected = true
+        val record = prefs.records.firstOrNull { it.address == address } ?: return
+        val state = _uiState.value
+        if (state.selectedAddress == address) {
+            when (state.phase) {
+                Phase.READY, Phase.CONNECTING, Phase.AUTHENTICATING, Phase.RECONNECTING -> return
+                else -> Unit
+            }
         }
+        connectRecord(record.address)
     }
 
     fun release() {
@@ -153,12 +221,24 @@ object RemoRepository {
     // ---------------------------------------------------------------- 连接
 
     fun connectSaved() {
-        val address = prefs.deviceAddress
-        if (address.isBlank()) {
-            message("还没有保存设备，请先在“设备”页扫描连接")
+        val record = _uiState.value.selectedRecord ?: prefs.records.firstOrNull()
+        if (record == null) {
+            message("还没有保存遥控器，点击右上角 + 添加")
             return
         }
-        connect(address, prefs.deviceName, prefs.guestMode, prefs.password)
+        connectRecord(record.address)
+    }
+
+    fun connectRecord(address: String) {
+        val record = prefs.records.firstOrNull { it.address == address } ?: return
+        if (_uiState.value.phase == Phase.READY &&
+            _uiState.value.device.deviceAddress == address
+        ) {
+            prefs.selectedAddress = address
+            _uiState.update { it.copy(selectedAddress = address) }
+            return
+        }
+        connect(record.address, record.deviceName, record.guest, record.password)
     }
 
     fun connect(address: String, name: String, guest: Boolean, password: String) {
@@ -166,16 +246,36 @@ object RemoRepository {
         prefs.deviceName = name
         prefs.guestMode = guest
         prefs.password = password
+        prefs.selectedAddress = address
+
+        val existing = prefs.records.firstOrNull { it.address == address }
+        val record = (existing ?: RemoteRecord(address = address)).copy(
+            deviceName = name.ifBlank { existing?.deviceName.orEmpty() },
+            guest = guest,
+            password = password,
+        )
+        val records = saveRecordInternal(record)
+
         _uiState.update {
             it.copy(
-                savedDevice = ConnectionInfo(name, address),
-                device = ConnectionInfo(name, address),
+                savedDevice = ConnectionInfo(record.title, address),
+                device = ConnectionInfo(record.deviceName, address),
                 guestMode = guest,
                 password = password,
+                records = records,
+                selectedAddress = address,
+                phase = Phase.CONNECTING,
+                busy = false,
+                // 切换设备时先清空上一台的状态，避免误读旧数据
+                ac = AcState(),
+                capabilities = DeviceCapabilities(),
+                passwordError = false,
                 error = null,
             )
         }
         stopScan()
+        // 切换遥控器时先停掉旧设备的轮询，避免旧任务对新链路发命令
+        stopPolling()
         stopConnectionLoop()
         userStopped = false
         startConnectionLoop()
@@ -228,7 +328,8 @@ object RemoRepository {
                     log("连接", "连接失败：$msg")
                     if (e is ProtocolException && e.passwordError) {
                         setPhase(Phase.ERROR)
-                        message(e.message ?: "密码错误，请在设置页检查 4 位密码")
+                        _uiState.update { it.copy(passwordError = true) }
+                        message("「${findRecord(prefs.deviceAddress)?.title ?: "遥控器"}」密码错误，请核对后重试")
                         break
                     }
                     if (e is ProtocolException && e.code == 2) {
@@ -270,13 +371,197 @@ object RemoRepository {
     }
 
     fun forgetDevice() {
-        disconnect()
-        prefs.deviceAddress = ""
-        prefs.deviceName = ""
+        deleteRecord(_uiState.value.selectedAddress)
+    }
+
+    // ---------------------------------------------------------------- 遥控器记录
+
+    fun findRecord(address: String): RemoteRecord? =
+        _uiState.value.records.firstOrNull { it.address == address }
+
+    fun pendingTimers(): List<RemoteRecord> =
+        _uiState.value.records
+            .filter { it.timerAt > System.currentTimeMillis() }
+            .sortedBy { it.timerAt }
+
+    /** 已经错过执行时间的任务。留 15 分钟宽限期，给 Doze 延迟触发的闹钟补执行机会。 */
+    fun expiredTimers(): List<RemoteRecord> {
+        val deadline = System.currentTimeMillis() - TIMER_GRACE_MS
+        return _uiState.value.records.filter { it.timerAt in 1 until deadline }
+    }
+
+    /** 新增或更新一条记录；[connectNow] 为 true 时立即连接。 */
+    fun upsertRecord(record: RemoteRecord, connectNow: Boolean = false) {
+        val records = saveRecordInternal(record)
         _uiState.update {
-            it.copy(savedDevice = ConnectionInfo(), device = ConnectionInfo())
+            // 刚添加的设备同步从扫描列表里移除，避免仍显示“未添加”
+            it.copy(
+                records = records,
+                scanDevices = it.scanDevices.filterNot { d -> d.address == record.address },
+            )
         }
-        message("已清除保存的设备")
+        if (connectNow) connectRecord(record.address)
+    }
+
+    fun renameRecord(address: String, alias: String) {
+        updateRecord(address) { it.copy(alias = alias.trim()) }
+    }
+
+    fun deleteRecord(address: String) {
+        if (address.isBlank()) return
+        finishTimer(address)
+        val records = prefs.records.filterNot { it.address == address }
+        prefs.records = records
+        if (prefs.selectedAddress == address) {
+            disconnect()
+            val next = records.firstOrNull()
+            prefs.selectedAddress = next?.address.orEmpty()
+            prefs.deviceAddress = next?.address.orEmpty()
+            prefs.deviceName = next?.deviceName.orEmpty()
+            _uiState.update {
+                it.copy(
+                    records = records,
+                    selectedAddress = next?.address.orEmpty(),
+                    savedDevice = ConnectionInfo(next?.title.orEmpty(), next?.address.orEmpty()),
+                    device = ConnectionInfo(next?.deviceName.orEmpty(), next?.address.orEmpty()),
+                )
+            }
+            if (next != null && prefs.autoConnect) connectRecord(next.address)
+        } else {
+            _uiState.update { it.copy(records = records) }
+        }
+        TimerService.sync(appContext)
+        message("已删除遥控器")
+    }
+
+    // ---------------------------------------------------------------- 定时关闭
+
+    fun setTimer(address: String, at: Long) {
+        val record = updateRecord(address) { it.copy(timerAt = at) } ?: return
+        TimerScheduler.schedule(appContext, record)
+        TimerService.sync(appContext)
+        message("已设置定时关闭")
+    }
+
+    /** 用户主动取消：同时停止前台保活服务。 */
+    fun clearTimer(address: String) {
+        if (findRecord(address)?.timerAt == 0L) return
+        finishTimer(address)
+        TimerService.sync(appContext)
+        message("已取消定时关闭")
+    }
+
+    /** 只清理任务和闹钟，不启动服务；供定时服务内部使用，避免重复拉起。 */
+    fun finishTimer(address: String) {
+        updateRecord(address) { it.copy(timerAt = 0L) }
+        TimerScheduler.cancel(appContext, address)
+    }
+
+    /**
+     * 定时任务执行：连接目标遥控器并把空调关掉。
+     * 失败会重试 3 轮，每轮 25 秒连接超时、间隔 10 秒。
+     */
+    suspend fun turnOffForTimer(address: String): Boolean {
+        val record = findRecord(address) ?: return false
+        repeat(3) { attempt ->
+            log("定时", "第 ${attempt + 1} 次尝试关闭「${record.title}」")
+            if (ensureConnectedForTimer(record)) {
+                if (sendPowerOff()) {
+                    log("定时", "「${record.title}」已关闭")
+                    return true
+                }
+            }
+            if (attempt < 2) delay(10_000)
+        }
+        log("定时", "关闭「${record.title}」失败")
+        return false
+    }
+
+    private suspend fun ensureConnectedForTimer(record: RemoteRecord): Boolean {
+        val state = _uiState.value
+        if (state.phase == Phase.READY && state.device.deviceAddress == record.address) {
+            return true
+        }
+        connect(record.address, record.deviceName, record.guest, record.password)
+        return withTimeoutOrNull(30_000) {
+            uiState.first { it.phase == Phase.READY && it.device.deviceAddress == record.address }
+            true
+        } ?: false
+    }
+
+    private suspend fun sendPowerOff(): Boolean = commandMutex.withLock {
+        try {
+            _uiState.update { it.copy(busy = true) }
+            val current = engine.readState()
+            if (current != null) {
+                publishState(current)
+                if (!current.power) return@withLock true
+            }
+            val next = engine.control(
+                (current ?: _uiState.value.ac).copy(power = false),
+                ControlFlags.POWER,
+                _uiState.value.capabilities.vaneControl,
+            )
+            if (next != null) publishState(next)
+            if (next?.power == false) return@withLock true
+            val confirm = engine.readState()
+            if (confirm != null) publishState(confirm)
+            confirm?.power == false
+        } catch (e: Exception) {
+            log("定时", "发送关机命令失败：${e.message}")
+            false
+        } finally {
+            _uiState.update { it.copy(busy = false) }
+        }
+    }
+
+    // ---------------------------------------------------------------- 记录内部操作
+
+    private fun saveRecordInternal(record: RemoteRecord): List<RemoteRecord> {
+        val list = prefs.records.toMutableList()
+        val index = list.indexOfFirst { it.address == record.address }
+        if (index >= 0) list[index] = record else list.add(record)
+        prefs.records = list
+        return list
+    }
+
+    private fun updateRecord(
+        address: String,
+        transform: (RemoteRecord) -> RemoteRecord,
+    ): RemoteRecord? {
+        val list = prefs.records
+        val index = list.indexOfFirst { it.address == address }
+        if (index < 0) return null
+        val updated = transform(list[index])
+        val newList = list.toMutableList().apply { set(index, updated) }
+        prefs.records = newList
+        _uiState.update { it.copy(records = newList) }
+        return updated
+    }
+
+    private var lastRssiSavedAt = 0L
+
+    private fun updateSelectedRssi(rssi: Int) {
+        val address = _uiState.value.selectedAddress
+        if (address.isBlank()) return
+        updateRecordRssi(address, rssi)
+    }
+
+    private fun updateRecordRssi(address: String, rssi: Int) {
+        val records = _uiState.value.records
+        val index = records.indexOfFirst { it.address == address }
+        if (index < 0) return
+        val updated = records[index].withRssi(rssi)
+        if (updated == records[index]) return
+        val newList = records.toMutableList().apply { set(index, updated) }
+        _uiState.update { it.copy(records = newList) }
+
+        // 信号只是展示用的瞬时值，最多每 30 秒落一次盘，避免扫描时频繁写 JSON
+        val now = System.currentTimeMillis()
+        if (now - lastRssiSavedAt > 30_000) {
+            lastRssiSavedAt = now
+            prefs.records = newList
+        }
     }
 
     // ---------------------------------------------------------------- 扫描
@@ -303,6 +588,179 @@ object RemoRepository {
         scanTimeoutJob = null
         ble.stopScan()
         _uiState.update { it.copy(scanning = false) }
+    }
+
+    // ---------------------------------------------------------------- 信号监测
+
+    private var signalScanJob: Job? = null
+
+    /** 本轮信号扫描期间扫到过的地址（只改主线程，无需加锁） */
+    private val scanSeen = mutableSetOf<String>()
+
+    /** 本轮扫描期间攒下的信号值，等轮末统一写入，避免卡片数值每包都跳 */
+    private val pendingRssi = mutableMapOf<String, Int>()
+
+    /** 是否正在做信号扫描窗口，用于判断 [scanSeen] 是否有效 */
+    private var trackingScan = false
+
+    /** 每个地址连续几轮没扫到，用于避免偶发漏扫导致卡片乱跳 */
+    private val missedRounds = mutableMapOf<String, Int>()
+
+    /**
+     * 首页可见时的信号任务：
+     * 1. 启动后先扫 1 秒，把信号最好的遥控器设为默认选中（整轮只做一次）；
+     * 2. 之后每 5 秒扫一轮，只更新信号并刷新一次显示顺序，不再改动选中项。
+     */
+    fun startSignalMonitor() {
+        if (signalScanJob?.isActive == true) return
+        signalScanJob = scope.launch {
+            // 等权限 / 等有遥控器记录，然后做一次启动检测
+            while (isActive && !initialSelectionDone) {
+                val state = _uiState.value
+                if (state.records.isEmpty() || !ble.hasPermissions()) {
+                    delay(300)
+                    continue
+                }
+                selectBestBySignal()
+            }
+            while (isActive) {
+                val startedAt = SystemClock.elapsedRealtime()
+                scanSignalsOnce()
+                // 固定 5 秒一轮：扣除本轮扫描耗时后再等待
+                val elapsed = SystemClock.elapsedRealtime() - startedAt
+                delay((SIGNAL_SCAN_INTERVAL_MS - elapsed).coerceAtLeast(500L))
+            }
+        }
+    }
+
+    fun stopSignalMonitor() {
+        signalScanJob?.cancel()
+        signalScanJob = null
+        if (!_uiState.value.scanning) ble.stopScan()
+    }
+
+    /** 启动时扫 1 秒，从本轮扫到的设备里挑信号最好的设为默认；用户已手动选择过则跳过。 */
+    private suspend fun selectBestBySignal() {
+        if (userSelected) {
+            initialSelectionDone = true
+            return
+        }
+        if (_uiState.value.records.isEmpty()) {
+            initialSelectionDone = true
+            return
+        }
+        runSignalScan(INITIAL_SCAN_MS)
+        initialSelectionDone = true
+
+        if (userSelected) return
+        val state = _uiState.value
+        // 已经在连接或已连接（例如定时任务刚拉起）就不要打断
+        if (state.phase != Phase.DISCONNECTED) return
+        // 只在本轮真正扫到的设备里挑，避免用上次留下的旧信号值
+        val best = state.records
+            .filter { it.address in scanSeen && it.signal > 0 }
+            .maxByOrNull { it.signal }
+        val target = best ?: state.selectedRecord ?: state.records.first()
+
+        if (prefs.autoConnect) {
+            connectRecord(target.address)
+        } else {
+            prefs.selectedAddress = target.address
+            _uiState.update {
+                it.copy(
+                    selectedAddress = target.address,
+                    savedDevice = ConnectionInfo(target.title, target.address),
+                    device = ConnectionInfo(target.deviceName, target.address),
+                )
+            }
+        }
+    }
+
+    private suspend fun scanSignalsOnce() {
+        val state = _uiState.value
+        if (state.records.isEmpty()) return
+        if (!ble.hasPermissions()) return
+        // 正在连接/登录时先让路；用户自己在扫描时等这一轮结束
+        if (state.phase == Phase.CONNECTING || state.phase == Phase.AUTHENTICATING) return
+        if (state.scanning) {
+            delay(SIGNAL_SCAN_WINDOW_MS)
+            return
+        }
+        runSignalScan(SIGNAL_SCAN_WINDOW_MS)
+    }
+
+    /** 打开一轮信号扫描窗口，结束后统一结算信号和显示顺序。 */
+    private suspend fun runSignalScan(windowMs: Long) {
+        scanSeen.clear()
+        pendingRssi.clear()
+        trackingScan = true
+        try {
+            ble.startScan(quiet = true)
+            delay(windowMs)
+        } finally {
+            // 页面切走被取消时也要复位，否则后续扫描结果会一直往这里塞
+            trackingScan = false
+        }
+        // 期间用户可能打开了“添加遥控器”，此时不能把它的扫描停掉
+        val scanned = ble.isScanning()
+        if (!_uiState.value.scanning) ble.stopScan()
+        if (scanned) {
+            applyScanResult()
+            refreshDisplayOrder()
+        }
+    }
+
+    /**
+     * 用本轮扫到的结果更新信号：连续 [MISSED_ROUNDS_TO_CLEAR] 轮都没扫到的遥控器
+     * 视为不在范围内，信号归零排到最后；已连接设备靠 GATT 读 RSSI，不参与清零。
+     */
+    private fun applyScanResult() {
+        val seen = scanSeen.toSet()
+        val rssiMap = pendingRssi.toMap()
+        pendingRssi.clear()
+        val state = _uiState.value
+        val connectedAddress = state.device.deviceAddress
+            .takeIf { it.isNotBlank() && state.phase == Phase.READY }
+        var changed = false
+        val updated = state.records.map { record ->
+            if (record.address in seen) missedRounds[record.address] = 0
+            val fresh = rssiMap[record.address]
+            when {
+                // 本轮扫到的设备：轮末一次性写入最新信号
+                fresh != null && record.address != connectedAddress -> {
+                    val next = record.withRssi(fresh)
+                    if (next.rssi != record.rssi) changed = true
+                    next
+                }
+                record.address in seen || record.address == connectedAddress -> record
+                else -> {
+                    val missed = (missedRounds[record.address] ?: 0) + 1
+                    missedRounds[record.address] = missed
+                    if (missed >= MISSED_ROUNDS_TO_CLEAR && record.rssi != RemoteRecord.RSSI_UNKNOWN) {
+                        changed = true
+                        record.copy(rssi = RemoteRecord.RSSI_UNKNOWN)
+                    } else {
+                        record
+                    }
+                }
+            }
+        }
+        // 删掉的遥控器不再统计
+        missedRounds.keys.retainAll(state.records.mapTo(mutableSetOf()) { it.address })
+        if (changed) {
+            _uiState.update { it.copy(records = updated) }
+            prefs.records = updated
+        }
+    }
+
+    /** 按当前信号值生成一次显示顺序快照；选中项和保存顺序都不变。 */
+    private fun refreshDisplayOrder() {
+        val state = _uiState.value
+        val ordered = state.records
+            .sortedByDescending { it.signal }
+            .map { it.address }
+        if (ordered == state.displayOrder) return
+        _uiState.update { it.copy(displayOrder = ordered) }
     }
 
     // ---------------------------------------------------------------- 状态读取 / 控制
@@ -495,7 +953,8 @@ object RemoRepository {
         log("错误", "$action：$msg")
         setError(msg)
         if (e is ProtocolException && e.passwordError) {
-            message("密码错误，请在设置页检查密码")
+            _uiState.update { it.copy(passwordError = true) }
+            message("密码错误，长按顶部卡片可修改登录信息")
         } else if (!isLinkFailure(e)) {
             // 设备拒绝设置之类的业务错误也要让用户看到，而不是只在日志里
             message(msg)
@@ -522,20 +981,38 @@ object RemoRepository {
 
     private fun publishState(state: AcState) {
         _uiState.update {
-            it.copy(ac = state, lastUpdate = System.currentTimeMillis(), error = null)
+            it.copy(
+                ac = state,
+                lastUpdate = System.currentTimeMillis(),
+                error = null,
+                passwordError = false,
+            )
         }
     }
 
     private fun startPolling() {
         stopPolling()
         pollingJob = scope.launch {
+            // 后台期间不发任何命令（每次读状态都会和空调模块通信），
+            // 切回前台时先立即补读一次，保证界面显示的仍是最新状态
+            var wokeFromBackground = false
             while (isActive) {
-                delay(prefs.pollSeconds * 1000L)
+                if (!AppState.foreground) {
+                    wokeFromBackground = true
+                    delay(1_000)
+                    continue
+                }
+                if (!wokeFromBackground) {
+                    delay(prefs.pollSeconds * 1000L)
+                }
+                wokeFromBackground = false
+                if (!AppState.foreground) continue
                 if (_uiState.value.phase != Phase.READY) continue
                 if (!commandMutex.tryLock()) continue
                 try {
                     val state = engine.readState()
                     if (state != null) publishState(state)
+                    ble.readRssi()
                 } catch (e: Exception) {
                     if (e is CancellationException) throw e
                     log("轮询", "读取状态失败：${e.message}")
@@ -615,6 +1092,17 @@ object RemoRepository {
     }
 
     val isInitialized: Boolean get() = initialized
+
+    /** 定时任务错过后的补执行宽限期。 */
+    const val TIMER_GRACE_MS = 15 * 60_000L
+
+    /** 首页信号扫描：每 5 秒一轮，每轮持续 2 秒；启动时先扫 1 秒选默认设备。 */
+    private const val SIGNAL_SCAN_INTERVAL_MS = 5_000L
+    private const val SIGNAL_SCAN_WINDOW_MS = 2_000L
+    private const val INITIAL_SCAN_MS = 1_000L
+
+    /** 连续多少轮没扫到就认为信号为 0（避免偶发漏扫导致卡片乱跳）。 */
+    private const val MISSED_ROUNDS_TO_CLEAR = 2
 
     fun hasBluetoothPermission(): Boolean = initialized && ble.hasPermissions()
 

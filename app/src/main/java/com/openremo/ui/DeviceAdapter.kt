@@ -5,6 +5,7 @@ import android.view.ViewGroup
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
+import com.openremo.data.RemoteRecord
 import com.openremo.databinding.ItemDeviceBinding
 import com.openremo.protocol.ScannedDevice
 
@@ -27,7 +28,7 @@ class DeviceAdapter(
         fun bind(device: ScannedDevice) {
             binding.itemName.text = device.name
             binding.itemAddress.text = device.address
-            binding.itemRssi.text = "${device.rssi} dBm"
+            binding.itemRssi.text = "信号 ${RemoteRecord.rssiToQuality(device.rssi)}"
             binding.itemConnect.setOnClickListener { onConnect(device) }
             binding.itemCard.setOnClickListener { onConnect(device) }
         }

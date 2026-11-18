@@ -47,6 +47,9 @@ class RemoBleClient(private val context: Context) {
         fun onBleDisconnected(reason: String)
         fun onBleFrame(frame: L1Frame)
         fun onBleLog(tag: String, message: String)
+
+        /** 连接状态下读到的实时 RSSI，用于首页信号值。 */
+        fun onBleRssi(rssi: Int) = Unit
     }
 
     companion object {
@@ -125,6 +128,9 @@ class RemoBleClient(private val context: Context) {
 
     fun isConnected(): Boolean = ready
 
+    /** 当前是否正在扫描。 */
+    fun isScanning(): Boolean = scanning
+
     @SuppressLint("MissingPermission")
     fun hasPermissions(): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -137,7 +143,7 @@ class RemoBleClient(private val context: Context) {
         ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
 
     @SuppressLint("MissingPermission")
-    fun startScan() {
+    fun startScan(quiet: Boolean = false) {
         val adapter = adapter ?: run {
             listener?.onBleLog("BLE", "设备不支持蓝牙")
             return
@@ -159,7 +165,7 @@ class RemoBleClient(private val context: Context) {
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build()
             scanner.startScan(null, settings, scanCallback)
-            listener?.onBleLog("BLE", "开始扫描附近的三菱电机遥控器")
+            if (!quiet) listener?.onBleLog("BLE", "开始扫描附近的三菱电机遥控器")
         } catch (e: SecurityException) {
             scanning = false
             listener?.onBleLog("BLE", "扫描失败：${e.message}")
@@ -304,6 +310,16 @@ class RemoBleClient(private val context: Context) {
         writeChannel.trySend(frame)
     }
 
+    /** 主动读一次连接设备的 RSSI，回调 [Listener.onBleRssi]。 */
+    @SuppressLint("MissingPermission")
+    fun readRssi() {
+        if (!ready) return
+        try {
+            gatt?.readRemoteRssi()
+        } catch (_: SecurityException) {
+        }
+    }
+
     /** 丢弃还没发出去的帧（断线/重连时调用），避免旧命令写到新连接上。 */
     private fun drainWriteQueue() {
         while (writeChannel.tryReceive().isSuccess) {
@@ -382,7 +398,7 @@ class RemoBleClient(private val context: Context) {
         return acked
     }
 
-    @SuppressLint("MissingPermission")
+    @SuppressLint("MissingPermission", "WrongConstant")
     private fun startWrite(
         currentGatt: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
@@ -408,7 +424,7 @@ class RemoBleClient(private val context: Context) {
 
     private val gattCallback = object : BluetoothGattCallback() {
 
-        @SuppressLint("MissingPermission")
+        @SuppressLint("MissingPermission", "WrongConstant")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (gatt !== this@RemoBleClient.gatt) {
                 return
@@ -503,6 +519,13 @@ class RemoBleClient(private val context: Context) {
         ) {
             if (descriptor.uuid == CCCD_UUID) {
                 markReady()
+            }
+        }
+
+        override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
+            if (gatt !== this@RemoBleClient.gatt) return
+            if (status == BluetoothGatt.GATT_SUCCESS && rssi < 0) {
+                listener?.onBleRssi(rssi)
             }
         }
 
